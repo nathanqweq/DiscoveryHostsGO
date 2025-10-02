@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,7 +42,6 @@ func loadConfig(path string) {
 	log.Printf("[INFO] Configuração carregada com sucesso: %+v", config)
 }
 
-// Função simples de ping usando o comando do sistema
 func ping(ip string, timeout int) bool {
 	log.Printf("[PING] Testando IP %s", ip)
 	cmd := exec.Command("ping", "-c", "1", "-W", fmt.Sprintf("%d", timeout), ip)
@@ -55,7 +54,6 @@ func ping(ip string, timeout int) bool {
 	return false
 }
 
-// Consulta SNMP para obter sysName
 func getSNMPName(ip string) (string, error) {
 	log.Printf("[SNMP] Conectando ao host %s", ip)
 	g := &gosnmp.GoSNMP{
@@ -90,10 +88,8 @@ func getSNMPName(ip string) (string, error) {
 	return "", fmt.Errorf("OID não retornou string")
 }
 
-// Criação de host no Zabbix (simulada)
 func createZabbixHost(name, ip string) error {
 	log.Printf("[ZABBIX] Criando/verificando host %s (%s) no grupo %s via proxy %s", name, ip, config.ZabbixGroupID, config.ZabbixProxyID)
-	// Aqui entraria chamada real à API do Zabbix
 	return nil
 }
 
@@ -111,32 +107,65 @@ func worker(wg *sync.WaitGroup, jobs <-chan string) {
 	}
 }
 
-// Expande CIDR em lista de IPs
-func expandCIDR(cidr string) ([]string, error) {
-	log.Printf("[INFO] Expandindo range CIDR: %s", cidr)
-	ip, ipnet, err := net.ParseCIDR(cidr)
+// Expande formatos de range como 10.91.50.1-14 ou 10.91.50-51.1-14
+func expandRange(ipRange string) ([]string, error) {
+	parts := strings.Split(ipRange, ".")
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("formato inválido: %s", ipRange)
+	}
+
+	expandOctet := func(s string) ([]int, error) {
+		if strings.Contains(s, "-") {
+			bounds := strings.Split(s, "-")
+			start, err := strconv.Atoi(bounds[0])
+			if err != nil {
+				return nil, err
+			}
+			end, err := strconv.Atoi(bounds[1])
+			if err != nil {
+				return nil, err
+			}
+			var res []int
+			for i := start; i <= end; i++ {
+				res = append(res, i)
+			}
+			return res, nil
+		}
+		val, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, err
+		}
+		return []int{val}, nil
+	}
+
+	o1, err := expandOctet(parts[0])
 	if err != nil {
 		return nil, err
 	}
-	var ips []string
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
-		ips = append(ips, ip.String())
+	o2, err := expandOctet(parts[1])
+	if err != nil {
+		return nil, err
 	}
-	// remove network/broadcast
-	if len(ips) > 2 {
-		return ips[1 : len(ips)-1], nil
+	o3, err := expandOctet(parts[2])
+	if err != nil {
+		return nil, err
 	}
-	return ips, nil
-}
+	o4, err := expandOctet(parts[3])
+	if err != nil {
+		return nil, err
+	}
 
-// incrementa IP
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
+	var ips []string
+	for _, a := range o1 {
+		for _, b := range o2 {
+			for _, c := range o3 {
+				for _, d := range o4 {
+					ips = append(ips, fmt.Sprintf("%d.%d.%d.%d", a, b, c, d))
+				}
+			}
 		}
 	}
+	return ips, nil
 }
 
 func main() {
@@ -153,18 +182,13 @@ func main() {
 
 	for _, r := range config.Ranges {
 		r = strings.TrimSpace(r)
-		if strings.Contains(r, "/") { // CIDR
-			ips, err := expandCIDR(r)
-			if err != nil {
-				log.Printf("[ERRO] Erro expandindo CIDR %s: %v", r, err)
-				continue
-			}
-			for _, ip := range ips {
-				jobs <- ip
-			}
-		} else {
-			log.Printf("[INFO] Adicionando IP único: %s", r)
-			jobs <- r
+		ips, err := expandRange(r)
+		if err != nil {
+			log.Printf("[ERRO] Erro expandindo range %s: %v", r, err)
+			continue
+		}
+		for _, ip := range ips {
+			jobs <- ip
 		}
 	}
 
